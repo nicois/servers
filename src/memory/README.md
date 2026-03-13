@@ -294,13 +294,22 @@ By default, all clients sharing a server instance read and write the same knowle
 }
 ```
 
-When `MEMORY_BASE_DIR` is set:
+When `MEMORY_BASE_DIR` is set, a user identity must be established before any other tool will work. There are two ways to identify a user:
 
-1. Clients **must** call the `set_user` tool with a `userId` before any other tool will work. All other tools return an error until a user is bound.
-2. All subsequent operations on that session read/write to `<MEMORY_BASE_DIR>/<userId>.jsonl`.
-3. User IDs are sanitized to safe filenames (alphanumeric, `_`, `-`, `.`).
+1. **`set_user` tool** — the client calls `set_user` with a `userId` as its first action. Identity is bound to the session.
+2. **`X-MCP-User` HTTP header** — a reverse proxy or API gateway injects the header on each request. No `set_user` call needed.
 
-This fail-safe design prevents data from accidentally landing in a shared graph when a client forgets to identify itself.
+Once identified, all operations read/write to `<MEMORY_BASE_DIR>/<userId>.jsonl`. User IDs are sanitized to safe filenames (alphanumeric, `_`, `-`, `.`).
+
+If neither method provides a user identity, all tools return an error. This fail-safe design prevents data from accidentally landing in a shared graph.
+
+### Identity precedence
+
+When multiple sources are present, the first match wins:
+
+1. `set_user` binding for the current session
+2. `X-MCP-User` HTTP header on the current request
+3. Error (no user identified)
 
 ### Configuration precedence
 

@@ -279,13 +279,29 @@ function getOrCreateUserManager(userId: string): KnowledgeGraphManager {
   return mgr;
 }
 
-function getManagerForSession(sessionId?: string): KnowledgeGraphManager | null {
+export function extractUserIdFromHeaders(
+  headers?: Record<string, string | string[] | undefined>
+): string | null {
+  if (!headers) return null;
+  const value = headers["x-mcp-user"];
+  if (!value) return null;
+  const userId = Array.isArray(value) ? value[0] : value;
+  return userId && userId.length > 0 ? userId : null;
+}
+
+function getManagerForSession(extra?: {
+  sessionId?: string;
+  requestInfo?: { headers?: Record<string, string | string[] | undefined> };
+}): KnowledgeGraphManager | null {
   if (!memoryBaseDir) return defaultManager;
-  if (sessionId) {
-    const uid = sessionUsers.get(sessionId);
+  if (extra?.sessionId) {
+    const uid = sessionUsers.get(extra.sessionId);
     if (uid) return getOrCreateUserManager(uid);
   }
   if (globalUserId) return getOrCreateUserManager(globalUserId);
+  // Check for user identity in HTTP headers (e.g. set by a reverse proxy)
+  const headerUserId = extractUserIdFromHeaders(extra?.requestInfo?.headers);
+  if (headerUserId) return getOrCreateUserManager(headerUserId);
   // Multi-user mode is active but no user has been set — refuse to operate
   // so that data doesn't accidentally land in a shared default graph.
   return null;
@@ -293,7 +309,7 @@ function getManagerForSession(sessionId?: string): KnowledgeGraphManager | null 
 
 function setUserRequiredResponse() {
   return {
-    content: [{ type: "text" as const, text: "Error: No user set. Call set_user first to bind a user identity to this session." }],
+    content: [{ type: "text" as const, text: "Error: No user set. Call set_user or provide the X-MCP-User HTTP header to bind a user identity to this session." }],
     isError: true as const,
   };
 }
@@ -338,7 +354,7 @@ server.registerTool(
     }
   },
   async ({ entities }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     const result = await manager.createEntities(entities);
     return {
@@ -362,7 +378,7 @@ server.registerTool(
     }
   },
   async ({ relations }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     const result = await manager.createRelations(relations);
     return {
@@ -392,7 +408,7 @@ server.registerTool(
     }
   },
   async ({ observations }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     const result = await manager.addObservations(observations);
     return {
@@ -417,7 +433,7 @@ server.registerTool(
     }
   },
   async ({ entityNames }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     await manager.deleteEntities(entityNames);
     return {
@@ -445,7 +461,7 @@ server.registerTool(
     }
   },
   async ({ deletions }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     await manager.deleteObservations(deletions);
     return {
@@ -470,7 +486,7 @@ server.registerTool(
     }
   },
   async ({ relations }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     await manager.deleteRelations(relations);
     return {
@@ -493,7 +509,7 @@ server.registerTool(
     }
   },
   async (_args, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     const graph = await manager.readGraph();
     return {
@@ -518,7 +534,7 @@ server.registerTool(
     }
   },
   async ({ query }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     const graph = await manager.searchNodes(query);
     return {
@@ -543,7 +559,7 @@ server.registerTool(
     }
   },
   async ({ names }, extra) => {
-    const manager = getManagerForSession(extra?.sessionId);
+    const manager = getManagerForSession(extra);
     if (!manager) return setUserRequiredResponse();
     const graph = await manager.openNodes(names);
     return {

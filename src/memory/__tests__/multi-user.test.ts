@@ -7,6 +7,7 @@ import {
   sanitizeUserId,
   getUserMemoryFilePath,
   ensureMemoryBaseDir,
+  extractUserIdFromHeaders,
 } from '../index.js';
 
 describe('Multi-user helpers', () => {
@@ -102,6 +103,36 @@ describe('Multi-user helpers', () => {
 
       // Cleanup
       await fs.rmdir(result!);
+    });
+  });
+
+  describe('extractUserIdFromHeaders', () => {
+    it('should return null for undefined headers', () => {
+      expect(extractUserIdFromHeaders(undefined)).toBeNull();
+    });
+
+    it('should return null when x-mcp-user is not present', () => {
+      expect(extractUserIdFromHeaders({ 'content-type': 'application/json' })).toBeNull();
+    });
+
+    it('should extract a string header value', () => {
+      expect(extractUserIdFromHeaders({ 'x-mcp-user': 'alice' })).toBe('alice');
+    });
+
+    it('should extract the first value from an array header', () => {
+      expect(extractUserIdFromHeaders({ 'x-mcp-user': ['bob', 'ignored'] })).toBe('bob');
+    });
+
+    it('should return null for empty string value', () => {
+      expect(extractUserIdFromHeaders({ 'x-mcp-user': '' })).toBeNull();
+    });
+
+    it('should return null for undefined value', () => {
+      expect(extractUserIdFromHeaders({ 'x-mcp-user': undefined })).toBeNull();
+    });
+
+    it('should return null for empty array', () => {
+      expect(extractUserIdFromHeaders({ 'x-mcp-user': [] })).toBeNull();
     });
   });
 });
