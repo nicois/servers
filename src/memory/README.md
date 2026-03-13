@@ -296,10 +296,11 @@ By default, all clients sharing a server instance read and write the same knowle
 
 When `MEMORY_BASE_DIR` is set:
 
-1. Clients call the `set_user` tool with a `userId` to bind themselves to a user-specific knowledge graph.
+1. Clients **must** call the `set_user` tool with a `userId` before any other tool will work. All other tools return an error until a user is bound.
 2. All subsequent operations on that session read/write to `<MEMORY_BASE_DIR>/<userId>.jsonl`.
-3. Sessions that haven't called `set_user` use `<MEMORY_BASE_DIR>/default.jsonl`.
-4. User IDs are sanitized to safe filenames (alphanumeric, `_`, `-`, `.`).
+3. User IDs are sanitized to safe filenames (alphanumeric, `_`, `-`, `.`).
+
+This fail-safe design prevents data from accidentally landing in a shared graph when a client forgets to identify itself.
 
 ### Configuration precedence
 

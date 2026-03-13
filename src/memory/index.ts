@@ -279,14 +279,23 @@ function getOrCreateUserManager(userId: string): KnowledgeGraphManager {
   return mgr;
 }
 
-function getManagerForSession(sessionId?: string): KnowledgeGraphManager {
+function getManagerForSession(sessionId?: string): KnowledgeGraphManager | null {
   if (!memoryBaseDir) return defaultManager;
   if (sessionId) {
     const uid = sessionUsers.get(sessionId);
     if (uid) return getOrCreateUserManager(uid);
   }
   if (globalUserId) return getOrCreateUserManager(globalUserId);
-  return defaultManager;
+  // Multi-user mode is active but no user has been set — refuse to operate
+  // so that data doesn't accidentally land in a shared default graph.
+  return null;
+}
+
+function setUserRequiredResponse() {
+  return {
+    content: [{ type: "text" as const, text: "Error: No user set. Call set_user first to bind a user identity to this session." }],
+    isError: true as const,
+  };
 }
 
 // For tests
@@ -330,6 +339,7 @@ server.registerTool(
   },
   async ({ entities }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     const result = await manager.createEntities(entities);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -353,6 +363,7 @@ server.registerTool(
   },
   async ({ relations }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     const result = await manager.createRelations(relations);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -382,6 +393,7 @@ server.registerTool(
   },
   async ({ observations }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     const result = await manager.addObservations(observations);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
@@ -406,6 +418,7 @@ server.registerTool(
   },
   async ({ entityNames }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     await manager.deleteEntities(entityNames);
     return {
       content: [{ type: "text" as const, text: "Entities deleted successfully" }],
@@ -433,6 +446,7 @@ server.registerTool(
   },
   async ({ deletions }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     await manager.deleteObservations(deletions);
     return {
       content: [{ type: "text" as const, text: "Observations deleted successfully" }],
@@ -457,6 +471,7 @@ server.registerTool(
   },
   async ({ relations }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     await manager.deleteRelations(relations);
     return {
       content: [{ type: "text" as const, text: "Relations deleted successfully" }],
@@ -479,6 +494,7 @@ server.registerTool(
   },
   async (_args, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     const graph = await manager.readGraph();
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
@@ -503,6 +519,7 @@ server.registerTool(
   },
   async ({ query }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     const graph = await manager.searchNodes(query);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
@@ -527,6 +544,7 @@ server.registerTool(
   },
   async ({ names }, extra) => {
     const manager = getManagerForSession(extra?.sessionId);
+    if (!manager) return setUserRequiredResponse();
     const graph = await manager.openNodes(names);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
