@@ -132,6 +132,12 @@ Example:
   - Cannot switch user mid-session
   - Returns error if multi-user mode is not enabled
 
+## Transport
+
+This server uses **Streamable HTTP** transport (not stdio). It listens on `http://<HOST>:<PORT>/mcp` where `HOST` defaults to `127.0.0.1` and `PORT` defaults to `3000`. Both can be overridden via environment variables.
+
+Clients connect using the MCP Streamable HTTP protocol. Each client session gets a unique session ID via the `mcp-session-id` header.
+
 # Usage with Claude Desktop
 
 ### Setup
@@ -189,6 +195,8 @@ The server can be configured using the following environment variables:
 
 - `MEMORY_FILE_PATH`: Path to the memory storage JSONL file (default: `memory.jsonl` in the server directory)
 - `MEMORY_BASE_DIR`: Directory for multi-user memory storage. When set, each user gets a separate `.jsonl` file in this directory. See [Multi-User Mode](#multi-user-mode) below.
+- `PORT`: HTTP port to listen on (default: `3000`)
+- `HOST`: HTTP host/address to bind to (default: `127.0.0.1`)
 
 # VS Code Installation Instructions
 

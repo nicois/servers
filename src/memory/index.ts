@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  StreamableHTTPServerTransport,
+  EventStore,
+} from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import express, { Request, Response } from "express";
+import cors from "cors";
+import { randomUUID } from "node:crypto";
 
 // Define memory file path using environment variable with fallback
 export const defaultMemoryPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'memory.jsonl');
@@ -50,11 +56,8 @@ let MEMORY_FILE_PATH: string;
 let defaultManager: KnowledgeGraphManager;
 let memoryBaseDir: string | null = null;
 
-// Session-scoped user tracking (for multi-connection transports like SSE/HTTP)
+// Session-scoped user tracking
 const sessionUsers: Map<string, string> = new Map();
-
-// Fallback for transports without sessionId (stdio — single connection)
-let globalUserId: string | null = null;
 
 // Cache of per-user managers
 const userManagers: Map<string, KnowledgeGraphManager> = new Map();
@@ -298,7 +301,6 @@ function getManagerForSession(extra?: {
     const uid = sessionUsers.get(extra.sessionId);
     if (uid) return getOrCreateUserManager(uid);
   }
-  if (globalUserId) return getOrCreateUserManager(globalUserId);
   // Check for user identity in HTTP headers (e.g. set by a reverse proxy)
   const headerUserId = extractUserIdFromHeaders(extra?.requestInfo?.headers);
   if (headerUserId) return getOrCreateUserManager(headerUserId);
@@ -318,7 +320,6 @@ function setUserRequiredResponse() {
 export function _resetMultiUserState(): void {
   sessionUsers.clear();
   userManagers.clear();
-  globalUserId = null;
 }
 
 // Zod schemas for entities and relations
@@ -594,25 +595,22 @@ server.registerTool(
 
     const sessionId = extra?.sessionId as string | undefined;
 
-    if (sessionId) {
-      if (sessionUsers.has(sessionId)) {
-        return {
-          content: [{ type: "text" as const, text: "Error: User already set for this session. Cannot switch user mid-session." }],
-          structuredContent: { success: false, message: "User already set for this session. Cannot switch user mid-session." },
-          isError: true,
-        };
-      }
-      sessionUsers.set(sessionId, userId);
-    } else {
-      if (globalUserId) {
-        return {
-          content: [{ type: "text" as const, text: "Error: User already set for this session. Cannot switch user mid-session." }],
-          structuredContent: { success: false, message: "User already set for this session. Cannot switch user mid-session." },
-          isError: true,
-        };
-      }
-      globalUserId = userId;
+    if (!sessionId) {
+      return {
+        content: [{ type: "text" as const, text: "Error: No session ID available. set_user requires an HTTP-based transport with session support." }],
+        structuredContent: { success: false, message: "No session ID available. set_user requires an HTTP-based transport with session support." },
+        isError: true,
+      };
     }
+
+    if (sessionUsers.has(sessionId)) {
+      return {
+        content: [{ type: "text" as const, text: "Error: User already set for this session. Cannot switch user mid-session." }],
+        structuredContent: { success: false, message: "User already set for this session. Cannot switch user mid-session." },
+        isError: true,
+      };
+    }
+    sessionUsers.set(sessionId, userId);
 
     return {
       content: [{ type: "text" as const, text: `User set to "${userId}". All subsequent operations will use this user's knowledge graph.` }],
@@ -620,6 +618,34 @@ server.registerTool(
     };
   }
 );
+
+// Simple in-memory event store for SSE resumability
+class InMemoryEventStore implements EventStore {
+  private events: Map<string, { streamId: string; message: unknown }> = new Map();
+
+  async storeEvent(streamId: string, message: unknown): Promise<string> {
+    const eventId = randomUUID();
+    this.events.set(eventId, { streamId, message });
+    return eventId;
+  }
+
+  async replayEventsAfter(
+    lastEventId: string,
+    { send }: { send: (eventId: string, message: unknown) => Promise<void> }
+  ): Promise<string> {
+    const entries = Array.from(this.events.entries());
+    const startIndex = entries.findIndex(([id]) => id === lastEventId);
+    if (startIndex === -1) return lastEventId;
+
+    let lastId: string = lastEventId;
+    for (let i = startIndex + 1; i < entries.length; i++) {
+      const [eventId, { message }] = entries[i];
+      await send(eventId, message);
+      lastId = eventId;
+    }
+    return lastId;
+  }
+}
 
 async function main() {
   // Initialize memory file path with backward compatibility
@@ -643,12 +669,144 @@ async function main() {
   // Backward compat: keep the old variable working for any code that references it
   knowledgeGraphManager = defaultManager;
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Knowledge Graph MCP Server running on stdio");
+  // HTTP transport setup
+  const app = express();
+  app.use(cors({
+    origin: "*",
+    methods: "GET,POST,DELETE",
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
+    exposedHeaders: ["mcp-session-id", "last-event-id", "mcp-protocol-version"],
+  }));
+
+  const transports: Map<string, StreamableHTTPServerTransport> = new Map();
+
+  app.post("/mcp", async (req: Request, res: Response) => {
+    try {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && transports.has(sessionId)) {
+        transport = transports.get(sessionId)!;
+      } else if (!sessionId) {
+        // New session initialization
+        const eventStore = new InMemoryEventStore();
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          eventStore,
+          onsessioninitialized: (sid: string) => {
+            transports.set(sid, transport);
+          },
+        });
+
+        server.server.onclose = async () => {
+          const sid = transport.sessionId;
+          if (sid) transports.delete(sid);
+        };
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res);
+        return;
+      } else {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+          id: req?.body?.id,
+        });
+        return;
+      }
+
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("Error handling MCP request:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Internal server error" },
+          id: req?.body?.id,
+        });
+      }
+    }
+  });
+
+  app.get("/mcp", async (req: Request, res: Response) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports.has(sessionId)) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+        id: req?.body?.id,
+      });
+      return;
+    }
+    const transport = transports.get(sessionId)!;
+    await transport.handleRequest(req, res);
+  });
+
+  app.delete("/mcp", async (req: Request, res: Response) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports.has(sessionId)) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+        id: req?.body?.id,
+      });
+      return;
+    }
+    try {
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("Error handling session termination:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          jsonrpc: "2.0",
+          error: { code: -32603, message: "Error handling session termination" },
+          id: req?.body?.id,
+        });
+      }
+    }
+  });
+
+  const PORT = parseInt(process.env.PORT || "3000", 10);
+  const HOST = process.env.HOST || "127.0.0.1";
+  const httpServer = app.listen(PORT, HOST, () => {
+    console.error(`Knowledge Graph MCP Server listening on http://${HOST}:${PORT}/mcp`);
+  });
+
+  httpServer.on("error", (err: unknown) => {
+    const code = typeof err === "object" && err !== null && "code" in err
+      ? (err as { code?: unknown }).code
+      : undefined;
+    if (code === "EADDRINUSE") {
+      console.error(`Failed to start: Port ${PORT} is already in use.`);
+    } else {
+      console.error("HTTP server error:", err);
+    }
+    process.exit(1);
+  });
+
+  process.on("SIGINT", async () => {
+    console.error("Shutting down...");
+    for (const [sid, transport] of transports) {
+      try {
+        await transport.close();
+        transports.delete(sid);
+      } catch (error) {
+        console.error(`Error closing session ${sid}:`, error);
+      }
+    }
+    process.exit(0);
+  });
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+// Only start the server when this file is executed directly, not when imported by tests
+const isMainModule = process.argv[1] &&
+  path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1]);
+
+if (isMainModule) {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+  });
+}
