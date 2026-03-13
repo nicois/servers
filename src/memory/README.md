@@ -125,6 +125,13 @@ Example:
     - Relations between requested entities
   - Silently skips non-existent nodes
 
+- **set_user**
+  - Bind a user identity to the current session (requires `MEMORY_BASE_DIR`)
+  - Input: `userId` (string, 1-128 characters)
+  - All subsequent tool calls on the session operate on that user's private knowledge graph
+  - Cannot switch user mid-session
+  - Returns error if multi-user mode is not enabled
+
 # Usage with Claude Desktop
 
 ### Setup
@@ -181,6 +188,7 @@ The server can be configured using the following environment variables:
 ```
 
 - `MEMORY_FILE_PATH`: Path to the memory storage JSONL file (default: `memory.jsonl` in the server directory)
+- `MEMORY_BASE_DIR`: Directory for multi-user memory storage. When set, each user gets a separate `.jsonl` file in this directory. See [Multi-User Mode](#multi-user-mode) below.
 
 # VS Code Installation Instructions
 
@@ -267,6 +275,40 @@ Follow these steps for each interaction:
      b) Connect them to the current entities using relations
      c) Store facts about them as observations
 ```
+
+## Multi-User Mode
+
+By default, all clients sharing a server instance read and write the same knowledge graph. To isolate memories per user, set the `MEMORY_BASE_DIR` environment variable:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "env": {
+        "MEMORY_BASE_DIR": "/path/to/memory-dir"
+      }
+    }
+  }
+}
+```
+
+When `MEMORY_BASE_DIR` is set:
+
+1. Clients call the `set_user` tool with a `userId` to bind themselves to a user-specific knowledge graph.
+2. All subsequent operations on that session read/write to `<MEMORY_BASE_DIR>/<userId>.jsonl`.
+3. Sessions that haven't called `set_user` use `<MEMORY_BASE_DIR>/default.jsonl`.
+4. User IDs are sanitized to safe filenames (alphanumeric, `_`, `-`, `.`).
+
+### Configuration precedence
+
+| Config | Behavior |
+|---|---|
+| Neither env var set | Original single-file `memory.jsonl`, `set_user` returns error |
+| `MEMORY_FILE_PATH` only | Single-file at that path, `set_user` returns error |
+| `MEMORY_BASE_DIR` only | Multi-user enabled, default graph at `default.jsonl` in that dir |
+| Both set | `MEMORY_FILE_PATH` wins, multi-user disabled, warning logged |
 
 ## Building
 

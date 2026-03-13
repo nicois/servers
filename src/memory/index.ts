@@ -46,6 +46,19 @@ export async function ensureMemoryFilePath(): Promise<string> {
 // Initialize memory file path (will be set during startup)
 let MEMORY_FILE_PATH: string;
 
+// Multi-user state
+let defaultManager: KnowledgeGraphManager;
+let memoryBaseDir: string | null = null;
+
+// Session-scoped user tracking (for multi-connection transports like SSE/HTTP)
+const sessionUsers: Map<string, string> = new Map();
+
+// Fallback for transports without sessionId (stdio — single connection)
+let globalUserId: string | null = null;
+
+// Cache of per-user managers
+const userManagers: Map<string, KnowledgeGraphManager> = new Map();
+
 // We are storing our memory using entities, relations, and observations in a graph structure
 export interface Entity {
   name: string;
@@ -239,6 +252,50 @@ export class KnowledgeGraphManager {
 
 let knowledgeGraphManager: KnowledgeGraphManager;
 
+export function sanitizeUserId(userId: string): string {
+  return userId.replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+}
+
+export function getUserMemoryFilePath(baseDir: string, userId: string): string {
+  return path.join(baseDir, `${sanitizeUserId(userId)}.jsonl`);
+}
+
+export async function ensureMemoryBaseDir(): Promise<string | null> {
+  const baseDir = process.env.MEMORY_BASE_DIR;
+  if (!baseDir) return null;
+  const resolved = path.isAbsolute(baseDir)
+    ? baseDir
+    : path.join(path.dirname(fileURLToPath(import.meta.url)), baseDir);
+  await fs.mkdir(resolved, { recursive: true });
+  return resolved;
+}
+
+function getOrCreateUserManager(userId: string): KnowledgeGraphManager {
+  let mgr = userManagers.get(userId);
+  if (!mgr) {
+    mgr = new KnowledgeGraphManager(getUserMemoryFilePath(memoryBaseDir!, userId));
+    userManagers.set(userId, mgr);
+  }
+  return mgr;
+}
+
+function getManagerForSession(sessionId?: string): KnowledgeGraphManager {
+  if (!memoryBaseDir) return defaultManager;
+  if (sessionId) {
+    const uid = sessionUsers.get(sessionId);
+    if (uid) return getOrCreateUserManager(uid);
+  }
+  if (globalUserId) return getOrCreateUserManager(globalUserId);
+  return defaultManager;
+}
+
+// For tests
+export function _resetMultiUserState(): void {
+  sessionUsers.clear();
+  userManagers.clear();
+  globalUserId = null;
+}
+
 // Zod schemas for entities and relations
 const EntitySchema = z.object({
   name: z.string().describe("The name of the entity"),
@@ -271,8 +328,9 @@ server.registerTool(
       entities: z.array(EntitySchema)
     }
   },
-  async ({ entities }) => {
-    const result = await knowledgeGraphManager.createEntities(entities);
+  async ({ entities }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    const result = await manager.createEntities(entities);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: { entities: result }
@@ -293,8 +351,9 @@ server.registerTool(
       relations: z.array(RelationSchema)
     }
   },
-  async ({ relations }) => {
-    const result = await knowledgeGraphManager.createRelations(relations);
+  async ({ relations }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    const result = await manager.createRelations(relations);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: { relations: result }
@@ -321,8 +380,9 @@ server.registerTool(
       }))
     }
   },
-  async ({ observations }) => {
-    const result = await knowledgeGraphManager.addObservations(observations);
+  async ({ observations }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    const result = await manager.addObservations(observations);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       structuredContent: { results: result }
@@ -344,8 +404,9 @@ server.registerTool(
       message: z.string()
     }
   },
-  async ({ entityNames }) => {
-    await knowledgeGraphManager.deleteEntities(entityNames);
+  async ({ entityNames }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    await manager.deleteEntities(entityNames);
     return {
       content: [{ type: "text" as const, text: "Entities deleted successfully" }],
       structuredContent: { success: true, message: "Entities deleted successfully" }
@@ -370,8 +431,9 @@ server.registerTool(
       message: z.string()
     }
   },
-  async ({ deletions }) => {
-    await knowledgeGraphManager.deleteObservations(deletions);
+  async ({ deletions }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    await manager.deleteObservations(deletions);
     return {
       content: [{ type: "text" as const, text: "Observations deleted successfully" }],
       structuredContent: { success: true, message: "Observations deleted successfully" }
@@ -393,8 +455,9 @@ server.registerTool(
       message: z.string()
     }
   },
-  async ({ relations }) => {
-    await knowledgeGraphManager.deleteRelations(relations);
+  async ({ relations }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    await manager.deleteRelations(relations);
     return {
       content: [{ type: "text" as const, text: "Relations deleted successfully" }],
       structuredContent: { success: true, message: "Relations deleted successfully" }
@@ -414,8 +477,9 @@ server.registerTool(
       relations: z.array(RelationSchema)
     }
   },
-  async () => {
-    const graph = await knowledgeGraphManager.readGraph();
+  async (_args, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    const graph = await manager.readGraph();
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
@@ -437,8 +501,9 @@ server.registerTool(
       relations: z.array(RelationSchema)
     }
   },
-  async ({ query }) => {
-    const graph = await knowledgeGraphManager.searchNodes(query);
+  async ({ query }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    const graph = await manager.searchNodes(query);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
@@ -460,11 +525,64 @@ server.registerTool(
       relations: z.array(RelationSchema)
     }
   },
-  async ({ names }) => {
-    const graph = await knowledgeGraphManager.openNodes(names);
+  async ({ names }, extra) => {
+    const manager = getManagerForSession(extra?.sessionId);
+    const graph = await manager.openNodes(names);
     return {
       content: [{ type: "text" as const, text: JSON.stringify(graph, null, 2) }],
       structuredContent: { ...graph }
+    };
+  }
+);
+
+// Register set_user tool
+server.registerTool(
+  "set_user",
+  {
+    title: "Set User",
+    description: "Bind a user identity to the current session. All subsequent tool calls will operate on that user's private knowledge graph. Requires MEMORY_BASE_DIR to be configured.",
+    inputSchema: {
+      userId: z.string().min(1).max(128).describe("The user identifier to associate with this session")
+    },
+    outputSchema: {
+      success: z.boolean(),
+      message: z.string()
+    }
+  },
+  async ({ userId }, extra) => {
+    if (!memoryBaseDir) {
+      return {
+        content: [{ type: "text" as const, text: "Error: Multi-user mode is not enabled. Set the MEMORY_BASE_DIR environment variable to enable it." }],
+        structuredContent: { success: false, message: "Multi-user mode is not enabled. Set the MEMORY_BASE_DIR environment variable to enable it." },
+        isError: true,
+      };
+    }
+
+    const sessionId = extra?.sessionId as string | undefined;
+
+    if (sessionId) {
+      if (sessionUsers.has(sessionId)) {
+        return {
+          content: [{ type: "text" as const, text: "Error: User already set for this session. Cannot switch user mid-session." }],
+          structuredContent: { success: false, message: "User already set for this session. Cannot switch user mid-session." },
+          isError: true,
+        };
+      }
+      sessionUsers.set(sessionId, userId);
+    } else {
+      if (globalUserId) {
+        return {
+          content: [{ type: "text" as const, text: "Error: User already set for this session. Cannot switch user mid-session." }],
+          structuredContent: { success: false, message: "User already set for this session. Cannot switch user mid-session." },
+          isError: true,
+        };
+      }
+      globalUserId = userId;
+    }
+
+    return {
+      content: [{ type: "text" as const, text: `User set to "${userId}". All subsequent operations will use this user's knowledge graph.` }],
+      structuredContent: { success: true, message: `User set to "${userId}". All subsequent operations will use this user's knowledge graph.` }
     };
   }
 );
@@ -473,8 +591,23 @@ async function main() {
   // Initialize memory file path with backward compatibility
   MEMORY_FILE_PATH = await ensureMemoryFilePath();
 
-  // Initialize knowledge graph manager with the memory file path
-  knowledgeGraphManager = new KnowledgeGraphManager(MEMORY_FILE_PATH);
+  // Initialize multi-user base directory
+  memoryBaseDir = await ensureMemoryBaseDir();
+
+  if (memoryBaseDir && !process.env.MEMORY_FILE_PATH) {
+    // Multi-user mode: default graph lives inside the base dir
+    defaultManager = new KnowledgeGraphManager(path.join(memoryBaseDir, 'default.jsonl'));
+  } else {
+    // Single-file mode (original behavior)
+    defaultManager = new KnowledgeGraphManager(MEMORY_FILE_PATH);
+    if (memoryBaseDir && process.env.MEMORY_FILE_PATH) {
+      console.error('Warning: MEMORY_FILE_PATH is set alongside MEMORY_BASE_DIR. MEMORY_FILE_PATH takes precedence; multi-user mode is disabled.');
+      memoryBaseDir = null;
+    }
+  }
+
+  // Backward compat: keep the old variable working for any code that references it
+  knowledgeGraphManager = defaultManager;
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
